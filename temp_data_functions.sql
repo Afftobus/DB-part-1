@@ -1,103 +1,234 @@
 -- собственно, подкапотная магия
 
 -- первое, что нужно вызвать -------------------------------------------------------------------------------------------
--- эта функция посчитает размеры таблиц купленной базы, положит посчитанные значения в спец. таблицу
--- один раз дёрнули перед работой И БОЛЬШЕ НЕ ДЁРГАЕМ
 
-CREATE OR REPLACE FUNCTION public.count_tables_params(schema_name character varying)
-  RETURNS integer AS
-$BODY$
-DECLARE step record;
-BEGIN
- FOR step IN(SELECT * from temp_data.tables_info where nspname= $1)
- LOOP
-	BEGIN
-	EXECUTE FORMAT ('INSERT INTO temp_data.table_serial_offset
-		(schema, table_name, serial_column_name, delta_id, min_id)
-		VALUES (''%s'',''%s'',''%s'',
-			(SELECT (max(%s) - min(%s)) from %s),
-			(SELECT min(%s) from %s))
-		ON CONFLICT (schema, table_name, serial_column_name) DO UPDATE
-			SET
-			delta_id = excluded.delta_id,
-			min_id = excluded.min_id;
-		', step.nspname, step.related_table, step.related_column,
-		step.related_column, step.related_column, step.nspname||'.'||step.related_table,
-		step.related_column, step.nspname||'.'||step.related_table);
-	EXCEPTION   WHEN OTHERS   THEN RETURN 0;
-	END;
+-- тогда в качестве замены двум функциям могу предложить вот такой вариант.
+-- 9 запросов, которые повторяют тот же функционал.
 
-END LOOP;
-RETURN 1;
+-- account -------------------------------------------------------------------------------------------------------------
+with cnt as (select (max(account_id)-min(account_id))as delta, min(account_id) as min from new_big.account),
 
-END; $BODY$
-  LANGUAGE plpgsql VOLATILE;
+next as (select (nextval('headhunter.account_account_id_seq'))),
 
--- вторая функция ------------------------------------------------------------------------------------------------------
--- эта уже лезет в боевые базы и двигает последовательности, соглачно рачсетам из count_tables_params
--- дописывает дополнителдьные данные ы спец. таблицу
--- НЕ БУДЕТ выполняться, если в таковой уже есть значения.
--- эта фича, сделанная для предотвращения повторнрго сдвига последовательностей боевой базы
+corrected as (select setval('headhunter.account_account_id_seq',
+(select nextval from next)+ cnt.delta ) from cnt)
 
-CREATE OR REPLACE FUNCTION public.prepare_offsets_and_target_sequences(
-    source_schema_name character varying,
-    target_schema_name character varying,
-    temp_schema_name character varying)
-  RETURNS integer AS
-$BODY$
-DECLARE step record;
-DECLARE next_value integer;
-
-BEGIN
-
-FOR step IN(SELECT * from get_table_lens(source_schema_name))
-LOOP
-
-begin
-
-CONTINUE WHEN
-	(SELECT (serial_value_offset is not null)
-	FROM temp_data.table_serial_offset
-	WHERE table_name = step.table_name AND serial_column_name = step.serial_column_name AND schema = target_schema_name);
-
--- промониторил блокировки, устанавливаемые следующим запросом.
--- на момент получения значения для nextval установлена ROW EXCLUSIVE блокировка на изменяесой последовательности,
--- значит, не может быть ситуации, при которой между получением и установкой нового значения его кто-то менят.
-
-
-EXECUTE FORMAT
-('(with next as (select (nextval(''%s''))),
-corrected as (select setval(''%s'',(select nextval from next)+ %s ))
-
-select nextval
-from next, corrected)',
-target_schema_name||'.'||step.related_sequence_name,
-target_schema_name||'.'||step.related_sequence_name,
-(step.delta_id)) INTO next_value;
-
--- пишем результаты в базу
-EXECUTE FORMAT
-('insert into %s.table_serial_offset
+INSERT INTO temp_data.table_serial_offset
 	(table_name,
-	serial_value_offset,
 	serial_column_name,
+	serial_value_offset,
+	delta_id,
+	min_id,
 	schema)
-VALUES (''%s'', %s, ''%s'', ''%s'')
-ON CONFLICT (schema, table_name, serial_column_name)
-DO UPDATE SET serial_value_offset = EXCLUDED.serial_value_offset;',
-$3, -- into %s.table_serial_offset
-step.table_name, -- VALUES (''%s'',
-next_value,
-step.serial_column_name,
-target_schema_name);
---EXCEPTION   WHEN OTHERS   THEN RETURN 0; -- не хочу тут получать исключения, лучше уж кодом когда-нибудь обработаю
-end;
 
-END LOOP;
+SELECT 'account',
+	'account_id',
+	next.nextval,
+	delta,
+	min,
+	'headhunter'
+from cnt, next, corrected;
 
-RETURN 1;
-END; $BODY$
-  LANGUAGE plpgsql VOLATILE;
+
+-- company -------------------------------------------------------------------------------------------------------------
+with cnt as (select (max(company_id)-min(company_id))as delta, min(company_id) as min from new_big.company),
+
+next as (select (nextval('headhunter.company_company_id_seq'))),
+
+corrected as (select setval('headhunter.company_company_id_seq',
+(select nextval from next)+ cnt.delta ) from cnt)
+
+INSERT INTO temp_data.table_serial_offset
+	(table_name,
+	serial_column_name,
+	serial_value_offset,
+	delta_id,
+	min_id,
+	schema)
+
+SELECT 'company',
+	'company_id',
+	next.nextval,
+	delta,
+	min,
+	'headhunter'
+from cnt, next, corrected;
+
+-- account_to_company_relation -----------------------------------------------------------------------------------------
+with cnt as (select (max(account_to_company_relation_id)-min(account_to_company_relation_id))as delta,
+  min(account_to_company_relation_id) as min from new_big.account_to_company_relation),
+
+next as (select (nextval('headhunter.account_to_company_relation_account_to_company_relation_id_seq'))),
+
+corrected as (select setval('headhunter.account_to_company_relation_account_to_company_relation_id_seq',
+(select nextval from next)+ cnt.delta ) from cnt)
+
+INSERT INTO temp_data.table_serial_offset
+	(table_name,
+	serial_column_name,
+	serial_value_offset,
+	delta_id,
+	min_id,
+	schema)
+
+SELECT 'account_to_company_relation',
+	'account_to_company_relation_id',
+	next.nextval,
+	delta,
+	min,
+	'headhunter'
+from cnt, next, corrected;
+
+
+-- acc_to_comp_permission ----------------------------------------------------------------------------------------------
+with cnt as (select (max(acc_to_comp_permission_id)-min(acc_to_comp_permission_id))as delta,
+  min(acc_to_comp_permission_id) as min from new_big.acc_to_comp_permission),
+
+next as (select (nextval('headhunter.acc_to_comp_permission_acc_to_comp_permission_id_seq'))),
+
+corrected as (select setval('headhunter.acc_to_comp_permission_acc_to_comp_permission_id_seq',
+(select nextval from next)+ cnt.delta ) from cnt)
+
+INSERT INTO temp_data.table_serial_offset
+	(table_name,
+	serial_column_name,
+	serial_value_offset,
+	delta_id,
+	min_id,
+	schema)
+
+SELECT 'acc_to_comp_permission',
+	'acc_to_comp_permission_id',
+	next.nextval,
+	delta,
+	min,
+	'headhunter'
+from cnt, next, corrected;
+
+
+-- skill -------------------------------------------------------------------------------------------------------------
+with cnt as (select (max(skill_id)-min(skill_id))as delta, min(skill_id) as min from new_big.skill),
+
+next as (select (nextval('headhunter.skill_skill_id_seq'))),
+
+corrected as (select setval('headhunter.skill_skill_id_seq',
+(select nextval from next)+ cnt.delta ) from cnt)
+
+INSERT INTO temp_data.table_serial_offset
+	(table_name,
+	serial_column_name,
+	serial_value_offset,
+	delta_id,
+	min_id,
+	schema)
+
+SELECT 'skill',
+	'skill_id',
+	next.nextval,
+	delta,
+	min,
+	'headhunter'
+from cnt, next, corrected;
+
+
+-- vacancy -------------------------------------------------------------------------------------------------------------
+with cnt as (select (max(vacancy_id)-min(vacancy_id))as delta, min(vacancy_id) as min from new_big.vacancy),
+
+next as (select (nextval('headhunter.vacancy_vacancy_id_seq'))),
+
+corrected as (select setval('headhunter.vacancy_vacancy_id_seq',
+(select nextval from next)+ cnt.delta ) from cnt)
+
+INSERT INTO temp_data.table_serial_offset
+	(table_name,
+	serial_column_name,
+	serial_value_offset,
+	delta_id,
+	min_id,
+	schema)
+
+SELECT 'vacancy',
+	'vacancy_id',
+	next.nextval,
+	delta,
+	min,
+	'headhunter'
+from cnt, next, corrected;
+
+
+-- resume -------------------------------------------------------------------------------------------------------------
+with cnt as (select (max(resume_id)-min(resume_id))as delta, min(resume_id) as min from new_big.resume),
+
+next as (select (nextval('headhunter.resume_resume_id_seq'))),
+
+corrected as (select setval('headhunter.resume_resume_id_seq',
+(select nextval from next)+ cnt.delta ) from cnt)
+
+INSERT INTO temp_data.table_serial_offset
+	(table_name,
+	serial_column_name,
+	serial_value_offset,
+	delta_id,
+	min_id,
+	schema)
+
+SELECT 'resume',
+	'resume_id',
+	next.nextval,
+	delta,
+	min,
+	'headhunter'
+from cnt, next, corrected;
+
+
+-- resume_experience -------------------------------------------------------------------------------------------------------------
+with cnt as (select (max(resume_experience_id)-min(resume_experience_id))as delta, min(resume_experience_id) as min from new_big.resume_experience),
+
+next as (select (nextval('headhunter.resume_experience_resume_experience_id_seq'))),
+
+corrected as (select setval('headhunter.resume_experience_resume_experience_id_seq',
+(select nextval from next)+ cnt.delta ) from cnt)
+
+INSERT INTO temp_data.table_serial_offset
+	(table_name,
+	serial_column_name,
+	serial_value_offset,
+	delta_id,
+	min_id,
+	schema)
+
+SELECT 'resume_experience',
+	'resume_experience_id',
+	next.nextval,
+	delta,
+	min,
+	'headhunter'
+from cnt, next, corrected;
+
+
+-- message -------------------------------------------------------------------------------------------------------------
+with cnt as (select (max(message_id)-min(message_id))as delta, min(message_id) as min from new_big.message),
+
+next as (select (nextval('headhunter.message_message_id_seq'))),
+
+corrected as (select setval('headhunter.message_message_id_seq',
+(select nextval from next)+ cnt.delta ) from cnt)
+
+INSERT INTO temp_data.table_serial_offset
+	(table_name,
+	serial_column_name,
+	serial_value_offset,
+	delta_id,
+	min_id,
+	schema)
+
+SELECT 'message',
+	'message_id',
+	next.nextval,
+	delta,
+	min,
+	'headhunter'
+from cnt, next, corrected;
 
 -- отдельно вывел простую функцию, которая дёргает состояние копируемых таблиц -----------------------------------------
 -- всё просто, если хотим промониторить состояния копирования таблиц, дёграем и видим, что ещё недокопировано
