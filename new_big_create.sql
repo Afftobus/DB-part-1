@@ -8,7 +8,8 @@ CREATE TABLE new_big.account
   login VARCHAR(256) NOT NULL UNIQUE,
   password VARCHAR(256) NOT NULL,
   time_register TIMESTAMP WITH TIME ZONE NOT NULL,
-  time_last_login TIMESTAMP WITH TIME ZONE
+  time_last_login TIMESTAMP WITH TIME ZONE,
+  is_approved BOOLEAN NOT NULL
 );
 
 -------------------------------------------------------------------------------------------------------------
