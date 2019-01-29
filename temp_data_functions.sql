@@ -334,12 +334,15 @@ DECLARE current_table_pkey VARCHAR;
 DECLARE current_table_columns VARCHAR;
 DECLARE current_table_columns_corr VARCHAR;
 
+DECLARE conflict_prefix VARCHAR;
+
 BEGIN
   result:= 0;
 
 -- получим из конфига необходимые параметры
   SELECT value_text FROM temp_data.config WHERE param = 'source_scheme' INTO source_scheme;
   SELECT value_text FROM temp_data.config WHERE param = 'target_scheme' INTO target_scheme;
+  SELECT value_text FROM temp_data.config WHERE param = 'conflict_prefix' INTO conflict_prefix;
   SELECT value_int FROM temp_data.config WHERE param = 'numer_of_records_by_iteration' INTO numer_of_records_by_iteration;
 
 -- ищем таблицу, в которой записей больше 0
@@ -352,9 +355,9 @@ BEGIN
 	END IF;
 END LOOP;
 -- погнали!
--- если копировать больше нечего, выходим
-	IF result = 0 THEN RETURN 0; END IF;
 
+	-- если копировать больше нечего, выходим
+	IF result = 0 THEN RETURN 0; END IF;
 	-- получим набор колонок данной таблицы
 	SELECT string_agg(column_name,',')
 	FROM INFORMATION_SCHEMA.COLUMNS
@@ -380,20 +383,34 @@ BEGIN 	-- эту вещь сделаем отдельной транзакцие
 			(%s)
 			SELECT %s
 			FROM %s
-			WHERE %s IN (SELECT pkey FROM __temp__pkeys_in_work )',
+			WHERE %s IN (SELECT pkey FROM __temp__pkeys_in_work )
+			ON CONFLICT (login) DO UPDATE
+				SET
+				account_id = EXCLUDED.account_id ,
+				  login  = ''%s''||%s.%s||''__''||EXCLUDED.login ,
+				  password  = EXCLUDED.password ,
+				  time_register  = EXCLUDED.time_register ,
+				  time_last_login  = EXCLUDED.time_last_login ,
+				  is_approved  = EXCLUDED.is_approved
+
+			',
 			target_scheme||'.'||current_table,
 			current_table_columns,
 			current_table_columns_corr,
 			source_scheme||'.'||current_table,
-			current_table_pkey);
+			current_table_pkey,
+
+			conflict_prefix,
+			current_table,
+			current_table_pkey
+			);
 
 	-- если всё норм, удаляем кусок
 	 EXECUTE FORMAT ('DELETE FROM %s WHERE %s IN (SELECT pkey FROM __temp__pkeys_in_work )', source_scheme||'.'||current_table, current_table_pkey);
---EXCEPTION   WHEN OTHERS   THEN RETURN 0; -- не буду обрабатывать ексепшн тут, пусть летит в код
+	EXCEPTION   WHEN unique_violation THEN INSERT INTO temp_data.conflict_account(account_id)VALUES(1);--RETURN 0; -- не буду обрабатывать ексепшн тут, пусть летит в код
 END;
 	DROP TABLE __temp__pkeys_in_work;
 RETURN 1;
 
 END; $BODY$
   LANGUAGE plpgsql VOLATILE;
-
