@@ -281,15 +281,29 @@ END; $BODY$
 -- если его нигде не значится, то возвращаем как есть,
 -- если есть, то в виде "account+35647"
 
-CREATE OR REPLACE FUNCTION temp_data.correct_value(
+CREATE OR REPLACE FUNCTION temp_data.correct_value(CREATE OR REPLACE FUNCTION temp_data.correct_value(
     table_name character varying,
-    column_name character varying)
+    column_name character varying,
+    column_conlict character varying)
   RETURNS character varying AS
 $BODY$
 DECLARE min INTEGER;
 DECLARE value_offset INTEGER;
 
+DECLARE column_name_corrected VARCHAR;
+DECLARE conflict_prefix VARCHAR;
+
 BEGIN
+
+SELECT value_text FROM temp_data.config WHERE param = 'conflict_prefix' INTO conflict_prefix;
+
+
+IF column_conlict = column_name THEN
+	column_name_corrected := ''''||conflict_prefix||'''||'||$2;
+ELSE
+	column_name_corrected := $2;
+END IF;
+
 	value_offset:=0;
 	min:=0;
 
@@ -305,25 +319,23 @@ BEGIN
 		(fkeys.table = schema||'.'||$1 AND fkeys.column = $2) INTO min, value_offset;
 
 IF min <> 0 THEN
-	RETURN $2||'+'||(value_offset - min)::text;
+	RETURN column_name_corrected||'+'||(value_offset - min)::text;
 END IF;
-	RETURN $2;
+	RETURN column_name_corrected;
 
 END; $BODY$
   LANGUAGE plpgsql VOLATILE
   COST 100;
-ALTER FUNCTION temp_data.correct_value(character varying, character varying)
-  OWNER TO postgres;
-
 
 ------------------------------------------------------------------------------------------------------------------------
 ------------------------------ КОПИРОВАНИЕ -----------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION public.copy_next_chunk()
+CREATE OR REPLACE FUNCTION public.copy_next_chunk_2_0()
   RETURNS integer AS
 $BODY$
 DECLARE step record;
 DECLARE result INTEGER;
+DECLARE new_id INTEGER;
 
 DECLARE source_scheme VARCHAR;
 DECLARE target_scheme VARCHAR;
@@ -333,8 +345,9 @@ DECLARE current_table VARCHAR;
 DECLARE current_table_pkey VARCHAR;
 DECLARE current_table_columns VARCHAR;
 DECLARE current_table_columns_corr VARCHAR;
+DECLARE current_table_columns_conf VARCHAR;
 
-DECLARE conflict_prefix VARCHAR;
+DECLARE current_record RECORD;
 
 BEGIN
   result:= 0;
@@ -342,7 +355,6 @@ BEGIN
 -- получим из конфига необходимые параметры
   SELECT value_text FROM temp_data.config WHERE param = 'source_scheme' INTO source_scheme;
   SELECT value_text FROM temp_data.config WHERE param = 'target_scheme' INTO target_scheme;
-  SELECT value_text FROM temp_data.config WHERE param = 'conflict_prefix' INTO conflict_prefix;
   SELECT value_int FROM temp_data.config WHERE param = 'numer_of_records_by_iteration' INTO numer_of_records_by_iteration;
 
 -- ищем таблицу, в которой записей больше 0
@@ -358,6 +370,7 @@ END LOOP;
 
 	-- если копировать больше нечего, выходим
 	IF result = 0 THEN RETURN 0; END IF;
+
 	-- получим набор колонок данной таблицы
 	SELECT string_agg(column_name,',')
 	FROM INFORMATION_SCHEMA.COLUMNS
@@ -366,7 +379,7 @@ END LOOP;
 	-- колонки, которые ссылаются на последовательности должны быть модифицированы так, чтобы они
 	-- соответствовали новой базе и не конфликтовали, здесь строка с полями будет выглядеть примерно так:
 	-- account_id+302395,login,password,time_register,time_last_login
-	SELECT string_agg(temp_data.correct_value(current_table,column_name),',')
+	SELECT string_agg(temp_data.correct_value(current_table,column_name,''),',')
 	FROM INFORMATION_SCHEMA.COLUMNS
 	WHERE table_name = current_table AND table_schema = target_scheme INTO current_table_columns_corr;
 
@@ -375,40 +388,46 @@ END LOOP;
 
 	--вытащим список ключей с которыми будем работать
 	CREATE TEMP TABLE __temp__pkeys_in_work(pkey INT);
-	EXECUTE FORMAT ('INSERT INTO __temp__pkeys_in_work (pkey) select %s from %s limit %s', current_table_pkey, source_scheme||'.'||current_table, numer_of_records_by_iteration);
+	EXECUTE FORMAT ('INSERT INTO __temp__pkeys_in_work (pkey) select %s from %s limit %s',
+	current_table_pkey, source_scheme||'.'||current_table, numer_of_records_by_iteration);
 
-BEGIN 	-- эту вещь сделаем отдельной транзакцией
-	-- КОПИРУЕМ
-	EXECUTE FORMAT ('INSERT INTO %s
-			(%s)
-			SELECT %s
-			FROM %s
-			WHERE %s IN (SELECT pkey FROM __temp__pkeys_in_work )
-			ON CONFLICT (login) DO UPDATE
-				SET
-				account_id = EXCLUDED.account_id ,
-				  login  = ''%s''||%s.%s||''__''||EXCLUDED.login ,
-				  password  = EXCLUDED.password ,
-				  time_register  = EXCLUDED.time_register ,
-				  time_last_login  = EXCLUDED.time_last_login ,
-				  is_approved  = EXCLUDED.is_approved
+FOR step IN(SELECT pkey FROM __temp__pkeys_in_work)
+LOOP
 
-			',
+BEGIN
+EXECUTE FORMAT ('INSERT INTO %s (%s) (SELECT %s FROM %s as t1 WHERE t1.%s = %s)',
+		target_scheme||'.'||current_table,
+		current_table_columns,
+		current_table_columns_corr,
+		source_scheme||'.'||current_table,
+		current_table_pkey,
+		step.pkey);
+EXCEPTION
+	WHEN unique_violation  THEN
+	IF current_table = 'account' THEN
+
+	SELECT string_agg(temp_data.correct_value(current_table,column_name,'login'),',')
+	FROM INFORMATION_SCHEMA.COLUMNS
+	WHERE table_name = current_table AND table_schema = target_scheme INTO current_table_columns_conf;
+
+	EXECUTE FORMAT ('INSERT INTO %s (%s) (SELECT %s FROM %s as t1 WHERE t1.%s = %s) RETURNING account_id',
 			target_scheme||'.'||current_table,
 			current_table_columns,
-			current_table_columns_corr,
+			current_table_columns_conf,
 			source_scheme||'.'||current_table,
 			current_table_pkey,
+			step.pkey) INTO new_id;
 
-			conflict_prefix,
-			current_table,
-			current_table_pkey
-			);
-
-	-- если всё норм, удаляем кусок
-	 EXECUTE FORMAT ('DELETE FROM %s WHERE %s IN (SELECT pkey FROM __temp__pkeys_in_work )', source_scheme||'.'||current_table, current_table_pkey);
-	EXCEPTION   WHEN unique_violation THEN INSERT INTO temp_data.conflict_account(account_id)VALUES(1);--RETURN 0; -- не буду обрабатывать ексепшн тут, пусть летит в код
+	EXECUTE FORMAT ('INSERT INTO temp_data.conflict_account (account_id, login) (SELECT   %s, login FROM %s as t1 WHERE t1.%s = %s)',
+			new_id,
+			source_scheme||'.'||current_table,
+			current_table_pkey,
+			step.pkey);
+	END IF;
 END;
+
+END LOOP;
+
 	DROP TABLE __temp__pkeys_in_work;
 RETURN 1;
 
